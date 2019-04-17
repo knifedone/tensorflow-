@@ -111,7 +111,7 @@ def _build_internal(self,
       #这里创建了filename_tensor,save_tensor以及restore_op节点
 ```
 build_internal(）这个函数中调用了_AddSaveOps()等函数，这个函数是BulkSaverBuilder()类中的内容，故简单的对该类进行说明
-### BuldSaverBuilder()
+#### BuldSaverBuilder()
 初始化：
 ```python
 class BaseSaverBuilder(object):
@@ -221,6 +221,98 @@ AddRestoreOps()这个函数返回一个op的聚合。 首先调用all_tensors得
 
     # Create a Noop that has control dependencies from all the updates.
     return control_flow_ops.group(*assign_ops, name=name) #把所有的restore 的op聚合在一起
+```
+### as_saver_def()
+调用该函数可以生成一个SaverDer
+```python
+  def as_saver_def(self):
+    return self.saver_def
+```
+### to_proto(export_scope=None)
+该函数功能和as_saver_def()类似，只不过多了一个export_scope，只输出指定export_scope下的内容
+```python
+  def to_proto(export_scope=None):
+    pass
+    return saver_def
+```
+### from_proto(saver_def, import_scope=None）
+顾名思义，在存在一个saverDef的protocol消息栈时，可以直接生成一个Saver类
+```python
+  def from_proto(saver_def, import_scope=None):
+    return Saver(saver_def=saver_def, name=import_scope)
+```
+### last_checkpoints(self):
+返回checkpoint列表
+```python
+@property
+  def last_checkpoints(self):
+    return list(self._CheckpointFilename(p) for p in self._last_checkpoints)
+```
+### save():
+save函数接受以下输入：
+*sess 用来存储变量的session
+*save_path: 生成checkpoint文件名的前缀
+*global_step
+*lastest_filename 一个自动维护的过去保存的checkpoint列表
+*meta_graph_suffix metaFraphDef文件的后缀
+*write_meta_graph 一个boolen变量，决定是否记录checkpointStataProto
+*strip_default_attrs: 一个boolen变量，如果为True,则默认值的状态将会被移除，该变量的存在可以增加graph的稳健性
+*save_debug_info: 一个boolen变量，决定是否记录debug信息
+save函数的输出为checkpoint的路径
+```python
+def save(self,...):
+  checkpoint_file = save_path
+  save_path_parent = os.path.dirname(save_path)
+  model_checkpoint_path = sess.run(
+              self.saver_def.save_tensor_name,
+              {self.saver_def.filename_tensor_name: checkpoint_file}) #这个节点在_build_internal()中定义此处run了一下并返回了checkpoint的路径
+  if write_state:
+    self._RecordLastCheckpoint(model_checkpoint_path)
+    checkpoint_management.update_checkpoint_state_internal(...)
+    self._MaybeDeleteOldCheckpoints(meta_graph_suffix=meta_graph_suffix)
+  if write_meta_graph:
+    meta_graph_filename = checkpoint_management.meta_graph_filename(
+          checkpoint_file, meta_graph_suffix=meta_graph_suffix)
+    with sess.graph.as_default():
+      self.export_meta_graph(
+          meta_graph_filename, strip_default_attrs=strip_default_attrs,
+          save_debug_info=save_debug_info)
+   return model_checkpoint_path
+```
+
+### restore(self,sess,save_path):
+从save_path中将值赋到sess中
+```python
+def restore(self, sess, save_path):
+  sess.run(self.saver_def.restore_op_name,
+                 {self.saver_def.filename_tensor_name: save_path}) #从save_path中读取值并赋到restore_op_name中
+  or
+  self._object_restore_saver.restore(sess=sess, save_path=save_path) #从object_based中读取
+   
+```
+
+### import_meta_graph(meta_graph_or_file,clear_devices,import_scope,##kwards):
+从MetaGraphDef文件中重新生成一个graph。这中恢复方式和restore有所不同。restore是在已经有计算图的各个节点的情况下，通过restore()将其中的数值恢复，import_meta_graph()则是重新生成一张图。这种方式更利于模型的持久化保存。
+```python
+def import_meta_graph(meta_graph_or_file, clear_devices=False,
+                      import_scope=None, **kwargs):
+  return _import_meta_graph_with_return_elements(
+      meta_graph_or_file, clear_devices, import_scope, **kwargs)[0]
+def _import_meta_graph_with_return_elements(
+    meta_graph_or_file, clear_devices=False, import_scope=None,
+    return_elements=None, **kwargs):
+    meta_graph_def = meta_graph_or_file
+    imported_vars, imported_return_elements = (
+      meta_graph.import_scoped_meta_graph_with_return_elements(
+          meta_graph_def,
+          clear_devices=clear_devices,
+          import_scope=import_scope,
+          return_elements=return_elements,
+          **kwargs))
+
+    saver = _create_saver_from_imported_meta_graph(
+      meta_graph_def, import_scope, imported_vars) #这个函数从meta_graph_def中读取sacer_def并生成Saver（）
+    return saver, imported_return_elements
 ```
 
 
