@@ -314,7 +314,54 @@ def _import_meta_graph_with_return_elements(
       meta_graph_def, import_scope, imported_vars) #这个函数从meta_graph_def中读取sacer_def并生成Saver（）
     return saver, imported_return_elements
 ```
+## Saveable_Object
+上文中大量涉及到了Saveable_Object,接下来就介绍一下tensorflow中的Saveable_Object
+### SaveSpec类：
+SaveSpec类是用来描述需要被保存的tensor切片的类
+```python
+class SaveSpec(object):
+  def __init__(self, tensor, slice_spec, name, dtype=None):
+    self._tensor = tensor 
+    self.slice_spec = slice_spec #需要保存的slice
+    self.name = name
+ ```
+ ### SaveableObject类
+ 该类为用于保存和重建的saveable对象的基类，该类包含四个对象：
+ *op op为该类包装的对象，它提供了一个需要保存的tensor列表
+ *spec: 一个SaveSpec的列表
+ *name:..
+ *_device
+ ```python
+class SaveableObject(object):
+  def __init__(self, op, specs, name):
+    self.op = op
+    self.specs = specs
+    self.name = name
+    self._device = None
+ ```
+
+### ReferenceVariableSaveable(saveable_object.SaveableObject)
+该类为SaveableObject的继承类，类的初始化支持var输入
+```python
+class ReferenceVariableSaveable(saveable_object.SaveableObject):
+  def __init__(self, var, slice_spec, name):
+    spec = saveable_object.SaveSpec(var, slice_spec, name, dtype=var.dtype)
+    super(ReferenceVariableSaveable, self).__init__(var, [spec], name)
+  def restore(self, restored_tensors, restored_shapes):
+    restored_tensor = restored_tensors[0]
+    if restored_shapes is not None:
+      restored_tensor = array_ops.reshape(restored_tensor, restored_shapes[0])
+    return state_ops.assign(
+        self.op,
+        restored_tensor,
+        validate_shape=restored_shapes is None and
+        self.op.get_shape().is_fully_defined()) #从restored_tensors中恢复self.op
 
 
+```
+### ResourceVariableSaveable(saveable_object.SaveableObject)
+```python
+
+```
 
   
