@@ -110,7 +110,7 @@ def _build_internal(self,
                                            restore_sequentially, reshape)
       #这里创建了filename_tensor,save_tensor以及restore_op节点
 ```
-build_internal(）这个函数中调用了_AddSaveOps()等函数，这个函数是BulkSaverBuilder()类中的内容，故简单的对该类进行说明
+###build_internal(）这个函数中调用了_AddSaveOps()等函数，这个函数是BulkSaverBuilder()类中的内容，故简单的对该类进行说明
 初始化：
 ```python
 class BaseSaverBuilder(object):
