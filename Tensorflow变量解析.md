@@ -68,7 +68,28 @@ class PartitionedVariable(object):
 ```
 ResourceVariable
 ----
-
+ResourceVariable可以被看做是RefVariable的加强版。简单的说，ResourceVariable可以在一系列的调用过程中保持状态不变，更加安全。与RefVariable类似，该类同样继承自Variable_v1，有相似的特性，同样可以被用来作为图中其他op的输入，并且具有Tensor中的特性。
+与RefVariable不同的是，ResourceVariable有更加严谨的定义。ResourceVariable的每一次使用都会在图中生成一个read_value的op.这些read_value op返回的tensor可以保证 1 任何与read_value有依赖的对ResourceVariable的更改都可以被追溯。 2 保证任何与read_value有依赖的操作都不会被更改。
+```python
+class ResourceVariable(variables.VariableV1):
+  def __init__(self,
+             initial_value=None,
+             trainable=True,
+             collections=None,
+             validate_shape=True,  # pylint: disable=unused-argument
+             caching_device=None,
+             name=None,
+             dtype=None,
+             variable_def=None,
+             import_scope=None,
+             constraint=None,
+             distribute_strategy=None,
+             synchronization=None,
+             aggregation=None):
+  _init_from_proto or _init_from_args
+```
+事实上，ResourceVariable和RefVariable的初始化暴露的接口是完全相同的，故在此不过多介绍。
+在init_from_args这个函数中，与RefVariable相比，增加了对Eager_mode的支持。在Ref的定义中，in_graph被默认为True,但在ResourceVariable中，这个属性的值取决于ResourceVariable是否处于Eager_mode。
 ```python
   def _init_from_args(self,
                       initial_value=None,
@@ -99,4 +120,88 @@ ResourceVariable
     self._constraint = constraint
     
         
+```
+```python
+def eager_safe_variable_handle(initial_value, shared_name, name, graph_mode):
+  """Creates a variable handle with information to do shape inference.
+
+  The shape and dtype are read from `initial_value` and stored in the returned
+  resource tensor's handle data.
+
+  If `initial_value.dtype == tf.variant`, we additionally extract the handle
+  data (if any) from `initial_value` and append it to the `handle_data`.
+  In this case, the returned tensor's handle data is in the form
+
+  
+  is_set: true
+  shape_and_type {
+    shape {
+      // initial_value.shape
+    }
+    dtype: DT_VARIANT
+  }
+  shape_and_type {
+    // handle_data(initial_value).shape_and_type[0]
+  }
+  shape_and_type {
+    // handle_data(initial_value).shape_and_type[1]
+  }
+  
+
+
+  Ops that read from this tensor, such as `ReadVariableOp` and
+  `AssignVariableOp`, know that `handle_data(handle).shape_and_type[1:]`
+  correspond to the handle data of the variant(s) stored in the Variable.
+
+  Args:
+    initial_value: A `Tensor`.
+    shared_name: A string.
+    name: A string.
+    graph_mode: A python bool.
+
+  Returns:
+    The handle, a `Tensor` of type `resource`.
+  """
+  shape = initial_value.get_shape()
+  dtype = initial_value.dtype.base_dtype
+  container = ops.get_default_graph()._container  # pylint: disable=protected-access
+  if container is None:
+    container = ""
+  handle = gen_resource_variable_ops.var_handle_op(shape=shape, dtype=dtype,
+                                                   shared_name=shared_name,
+                                                   name=name,
+                                                   container=container)
+
+  if graph_mode:
+    full_handle_data = _combine_handle_data(handle, initial_value)
+    _set_handle_shapes_and_types(handle, full_handle_data, graph_mode)
+    return handle
+  else:
+    # We do not want two distinct ResourceVariable objects for the same
+    # underlying resource in the runtime.
+    # When in eager mode, explicitly ensure so here. When in graph mode, it's
+    # ensured by always generating different variable names.
+    exists = gen_resource_variable_ops.var_is_initialized_op(handle)
+    if exists:
+      raise ValueError("variable object with name '%s' already created. Use "
+                       "get_variable() if reuse is desired." %
+                       shared_name)
+    with context.graph_mode(), ops.Graph().as_default() as graph:
+      h = gen_resource_variable_ops.var_handle_op(shape=shape, dtype=dtype,
+                                                  shared_name=shared_name,
+                                                  name=name,
+                                                  container=container)
+
+      # Tensor._handle_data contains information for the shape-inference code to
+      # know the shape and dtype of the variable pointed to by a handle. Since
+      # shape inference doesn't run in eager mode we copy this data here for
+      # when the handle is captured by an eager mode function.
+      # pylint: disable=protected-access
+      full_handle_data = _combine_handle_data(h, initial_value)
+      _set_handle_shapes_and_types(handle, full_handle_data, graph_mode)
+      # pylint: enable=protected-access
+    # Clean up op->graph->op reference cycles.
+    ops.dismantle_graph(graph)
+    return handle
+
 ```
