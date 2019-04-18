@@ -356,12 +356,71 @@ class ReferenceVariableSaveable(saveable_object.SaveableObject):
         restored_tensor,
         validate_shape=restored_shapes is None and
         self.op.get_shape().is_fully_defined()) #从restored_tensors中恢复self.op
+          #为什么这个不需要赋值到设备？？
 
 
 ```
 ### ResourceVariableSaveable(saveable_object.SaveableObject)
 ```python
+class ResourceVariableSaveable(saveable_object.SaveableObject):
+    def __init__(self, var, slice_spec, name):
+      self._var_device = var.device
+      self._var_shape = var.shape
+      if isinstance(var, ops.Tensor):  #如果var变量已经是ops.Tensor，则可以直接将handle_op和tensor记录下来
+        self.handle_op = var.op.inputs[0]
+        tensor = var
+      elif isinstance(var, resource_variable_ops.ResourceVariable): #如果var此时是ResourceVariable则需要将var复制过来再进行下一步操作
 
+        def _read_variable_closure(v): #这个函数主要是将不同设备上的变量拷贝到cpu0以方便记录
+          def f():
+            with ops.device(v.device):
+              x = v.read_value()
+              # To allow variables placed on non-CPU devices to be checkpointed,
+              # we copy them to CPU on the same machine first.
+              with ops.device("/device:CPU:0"):
+                return array_ops.identity(x)
+          return f
+
+        self.handle_op = var.handle
+        tensor = _read_variable_closure(var)
+      else:
+        raise ValueError(
+            "Saveable is neither a resource variable nor a read operation."
+            " Got: %s" % repr(var))
+      spec = saveable_object.SaveSpec(tensor, slice_spec, name,
+                                      dtype=var.dtype)
+      super(ResourceVariableSaveable, self).__init__(var, [spec], name)
+      
+      
+      
+   def restore(self, restored_tensors, restored_shapes):
+      restored_tensor = restored_tensors[0]
+      if restored_shapes is not None:
+        restored_tensor = array_ops.reshape(restored_tensor, restored_shapes[0]) #将restored_tensor进行reshape操作
+      # Copy the restored tensor to the variable's device.
+      with ops.device(self._var_device):   #需要将restored_tensors复制到var所在的设备上
+        restored_tensor = array_ops.identity(restored_tensor)
+        return resource_variable_ops.shape_safe_assign_variable_handle(
+            self.handle_op, self._var_shape, restored_tensor) #调用该函数
+    def saveable_op_objects_for_op(op,name): #该函数返回一个生成器，生成器中的内容是从op中生成的SaveableObject
+      (特别多if 先不写了，一会儿画个流程图）
+      pass
+    
+    def op_list_to_dict(op_list,convert_variable_to_tensor): #该函数接受一个op的列表并返回一个字典，字典的key是op的名字，value是op
+      （先不写了，一会儿的。。）
+    def validate_and_slice_inputs(names_to_saveables): #该函数接受一个op的字典，返回一个SaveableObject的列表
+        if not isinstance(names_to_saveables, dict):
+      names_to_saveables = op_list_to_dict(names_to_saveables) #这一步将list或者tuple转化成dict，dict里的元素是op
+
+      saveables = []
+      seen_ops = set()
+      for name, op in sorted(names_to_saveables.items(),
+                             # Avoid comparing ops, sort only by name.
+                             key=lambda x: x[0]):
+        for converted_saveable_object in saveable_objects_for_op(op, name):
+          _add_saveable(saveables, seen_ops, converted_saveable_object)
+      return saveables
+      
 ```
 
   
