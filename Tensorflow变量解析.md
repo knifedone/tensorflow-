@@ -112,6 +112,8 @@ class ResourceVariable(variables.VariableV1):
               shared_name=shared_name,
               name=name,
               graph_mode=self._in_graph_mode)
+              #这里生成了一个handle(其实就是一个tensor),这个handle保存了这个Variable的一些信息，例如shape, type, container等。
+              #据官方文档所说，在这个Variable的后续op中，都将调用这个handle
     self._shape = initial_value.shape
     self._unique_id = unique_id
     self._initial_value = initial_value if self._in_graph_mode else None
@@ -170,8 +172,8 @@ def eager_safe_variable_handle(initial_value, shared_name, name, graph_mode):
   handle = gen_resource_variable_ops.var_handle_op(shape=shape, dtype=dtype,
                                                    shared_name=shared_name,
                                                    name=name,
-                                                   container=container)
-
+                                                   container=container)  
+  #这里创建了一个handle用来处理ResourceVariable
   if graph_mode:
     full_handle_data = _combine_handle_data(handle, initial_value)
     _set_handle_shapes_and_types(handle, full_handle_data, graph_mode)
@@ -203,5 +205,25 @@ def eager_safe_variable_handle(initial_value, shared_name, name, graph_mode):
     # Clean up op->graph->op reference cycles.
     ops.dismantle_graph(graph)
     return handle
+
+```
+ResourceVariable中新增加了一些read相关的函数，这些函数通常都会调用_handle接口，并向计算图中登记。
+```python
+  def _read_variable_op(self):
+  #返回一个op
+    variable_accessed(self)
+    result = gen_resource_variable_ops.read_variable_op(self._handle,
+                                                        self._dtype) #read_variable_op()生成了一个op,这个op的功能是从_handle中读取variable
+    _maybe_set_handle_data(self._dtype, self._handle, result)  #暂时不知道这个是干嘛的....到时候先照着写吧。
+
+    if not context.executing_eagerly():
+      # Note that if a control flow context is active the input of the read op
+      # might not actually be the handle. This line bypasses it.
+      tape.record_operation(
+          "ReadVariableOp", [result], [self._handle], lambda x: [x]) #把这个op添加到tape流中，官方注释说这样可以保证input不仅仅是handle
+    return result
+```
+
+```python
 
 ```
