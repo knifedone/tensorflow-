@@ -1,0 +1,204 @@
+在tensorflow的kernal中定义了图结构。这篇blog就po一下代码然后分析一下。
+首先看一下graph.h文件中的内容。
+Node类
+Node类中定义了很多的功能，很复杂，在此我就精简一下，把主要功能列出来。
+```C++
+class Node {
+ public:
+  string DebugString() const;
+  int id() const { return id_; }
+  int cost_id() const { return cost_id_; }
+  const string& name() const;
+  const string& type_string() const;
+
+  // def() provides the NodeDef the user supplied, but the specifics
+  // of this Node may have changed due to placement, optimization, etc.
+  // In particular:
+  // * def().name() will match name();
+  // * def().op() will match type_string() and op_def().name();
+  // * def().input() is not reliable, use "in_edges()" below instead;
+  // * def().device() is the "user's requested device" and may not match
+  //   the actual assigned device, see assigned_device_name() below;
+  // * def().attr() is authoritative.
+  // TODO(irving): Replace with NodeInfo.
+  const NodeDef& def() const; //这里提供了用户提供定义的接口
+  const OpDef& op_def() const; //同理，在这里用户可以传入参数并定义op
+
+  // 这里定义了结点输入的数量，类型
+  int32 num_inputs() const;
+  DataType input_type(int32 i) const;
+  const DataTypeVector& input_types() const;
+  //这里定义了节点输出的数量，类型
+  int32 num_outputs() const;
+  DataType output_type(int32 o) const;
+  const DataTypeVector& output_types() const;
+
+
+  const string& requested_device() const; //该接口输出该节点所使用的设备
+
+  void set_requested_device(const string& device); //该接口允许用户指定该节点使用的设备
+
+  const string& assigned_device_name() const; 
+  void set_assigned_device_name(const string& device_name);
+  bool has_assigned_device_name() const {
+    return assigned_device_name_index_ > 0;
+  }
+  int assigned_device_name_index() const { return assigned_device_name_index_; }
+  void set_assigned_device_name_index(int index);   //上述带assign的都是在图运行时供assignop使用的
+
+  AttrSlice attrs() const;
+
+  // 该接口提供了一个供protobuf使用的输入，只是一个结构并非实际输入
+  const protobuf::RepeatedPtrField<string>& requested_inputs() const;
+
+  gtl::iterator_range<NeighborIter> in_nodes() const;
+  gtl::iterator_range<NeighborIter> out_nodes() const;
+  const EdgeSet& in_edges() const { return in_edges_; }
+  const EdgeSet& out_edges() const { return out_edges_; } //得到输入节点，输出节点，输入边，输出边等。
+
+  // Node type helpers.
+  bool IsSource() const { return id() == 0; }
+  bool IsSink() const { return id() == 1; }
+  // Anything other than the special Source & Sink nodes.
+  bool IsOp() const { return id() > 1; }
+
+  // Node class helpers
+  bool IsSwitch() const { return class_ == NC_SWITCH; }
+  bool IsMerge() const { return class_ == NC_MERGE; }
+  bool IsEnter() const { return class_ == NC_ENTER; }
+  bool IsExit() const { return class_ == NC_EXIT; }
+  bool IsNextIteration() const { return class_ == NC_NEXT_ITERATION; }
+  bool IsLoopCond() const { return class_ == NC_LOOP_COND; }
+  bool IsControlTrigger() const { return class_ == NC_CONTROL_TRIGGER; }
+  bool IsSend() const { return class_ == NC_SEND || class_ == NC_HOST_SEND; }
+  bool IsRecv() const { return class_ == NC_RECV || class_ == NC_HOST_RECV; }
+  bool IsConstant() const { return class_ == NC_CONSTANT; }
+  bool IsVariable() const { return class_ == NC_VARIABLE; }
+  bool IsIdentity() const { return class_ == NC_IDENTITY; }
+  bool IsGetSessionHandle() const { return class_ == NC_GET_SESSION_HANDLE; }
+  bool IsGetSessionTensor() const { return class_ == NC_GET_SESSION_TENSOR; }
+  bool IsDeleteSessionTensor() const {
+    return class_ == NC_DELETE_SESSION_TENSOR;
+  }
+  bool IsControlFlow() const {
+    return (class_ != NC_OTHER) &&  // Fast path
+           (IsSwitch() || IsMerge() || IsEnter() || IsExit() ||
+            IsNextIteration());
+  }
+  bool IsHostSend() const { return class_ == NC_HOST_SEND; }
+  bool IsHostRecv() const { return class_ == NC_HOST_RECV; }
+  bool IsScopedAllocator() const { return class_ == NC_SCOPED_ALLOCATOR; }
+  bool IsCollective() const { return class_ == NC_COLLECTIVE; }
+
+  bool IsMetadata() const { return class_ == NC_METADATA; }
+
+  template <typename T>
+  void AddAttr(const string& name, const T& val) {
+    SetAttrValue(val, AddAttrHelper(name));
+  }
+
+  void ClearAttr(const string& name);
+
+  // Returns into '*e' the edge connecting to the 'idx' input of this Node.
+  Status input_edge(int idx, const Edge** e) const;
+
+  // Returns into '*edges' the input data edges of this Node, indexed by input
+  // number. Does not return control edges.
+  Status input_edges(std::vector<const Edge*>* edges) const;
+
+  // Returns into '*n' the node that has an output connected to the
+  // 'idx' input of this Node.
+  Status input_node(int idx, const Node** n) const;
+  Status input_node(int idx, Node** n) const;
+
+  WhileContext* while_ctx() const { return while_ctx_; }
+  void set_while_ctx(WhileContext* while_ctx) {
+    DCHECK(IsExit());
+    DCHECK(while_ctx_ == nullptr);
+    while_ctx_ = while_ctx;
+  }
+
+ private:
+  friend class Graph;
+  Node();
+
+  NodeProperties* properties() const { return props_.get(); }
+
+  void Initialize(int id, int cost_id, std::shared_ptr<NodeProperties> props);
+
+  // Releases memory from props_, in addition to restoring *this to its
+  // uninitialized state.
+  void Clear();
+
+  // Make a copy of the Node's props_ if props_ is shared with
+  // other nodes. This must be called before mutating properties,
+  // e.g. in AddAttr.
+  void MaybeCopyOnWrite();
+
+  AttrValue* AddAttrHelper(const string& name);
+
+  // A set of mutually exclusive classes for different kinds of nodes,
+  // class_ is initialized in the Node::Initialize routine based on the
+  // node's type_string().
+  enum NodeClass {
+    NC_UNINITIALIZED,
+    NC_SWITCH,
+    NC_MERGE,
+    NC_ENTER,
+    NC_EXIT,
+    NC_NEXT_ITERATION,
+    NC_LOOP_COND,
+    NC_CONTROL_TRIGGER,
+    NC_SEND,
+    NC_HOST_SEND,
+    NC_RECV,
+    NC_HOST_RECV,
+    NC_CONSTANT,
+    NC_VARIABLE,
+    NC_IDENTITY,
+    NC_GET_SESSION_HANDLE,
+    NC_GET_SESSION_TENSOR,
+    NC_DELETE_SESSION_TENSOR,
+    NC_METADATA,
+    NC_SCOPED_ALLOCATOR,
+    NC_COLLECTIVE,
+    NC_OTHER  // Not a special kind of node
+  };
+
+  static const std::unordered_map<string, NodeClass>& kNodeClassTable;
+
+  static NodeClass GetNodeClassForOp(const string& ts);
+
+  int id_;       // -1 until Initialize() is called
+  int cost_id_;  // -1 if there is no corresponding cost accounting node
+  NodeClass class_;
+
+  EdgeSet in_edges_;
+  EdgeSet out_edges_;
+
+  // NOTE(skyewm): inheriting from core::RefCounted may have a slight
+  // performance benefit over using shared_ptr, at the cost of manual ref
+  // counting
+  std::shared_ptr<NodeProperties> props_;
+
+  // Index within Graph::device_names_ of the name of device assigned
+  // to perform this computation.
+  int assigned_device_name_index_;
+
+  // A back-pointer to the Graph that owns this node.  Currently, this exists
+  // solely to allow Node::[set_]assigned_device_name() to work. However, if all
+  // callers of Node::[set_]assigned_device_name() are modified to use the
+  // equivalent methods defined directly on Graph, then we can remove this
+  // field and reclaim that memory.
+  Graph* graph_;
+
+  // Set if this is an exit node of a while loop with an associated
+  // WhileContext. Otherwise null. (This is only set for exit nodes because
+  // they're the first nodes of a loop encountered while creating the gradient
+  // graph. Exit nodes that are part of while loop gradient graphs will not have
+  // this set.)
+  WhileContext* while_ctx_;
+
+  TF_DISALLOW_COPY_AND_ASSIGN(Node);
+};
+```
