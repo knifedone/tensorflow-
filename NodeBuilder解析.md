@@ -103,3 +103,115 @@ Status RewriteGraphForExecution(
 
 ```
 可以看出，节点创建的关键点在于FeedInputs和FetchOutputs
+```C++
+Status FeedInputs(
+    Graph* g, const std::vector<std::unique_ptr<PruneRewrite>>& feed_rewrites,
+    NameIndex* name_index, DataTypeVector* out_feed_types) {
+  out_feed_types->clear();
+  out_feed_types->reserve(feed_rewrites.size());
+  for (size_t i = 0; i < feed_rewrites.size(); ++i) {
+    const string& t = feed_rewrites[i]->endpoint_name();
+    TensorId id(ParseTensorName(t));   //这个函数暂时不太清楚是怎么实现的，可能是关键点
+
+    auto iter = name_index->find(id.first);    //在name_index中找到feed_rewrites中对应的node
+    if (iter == name_index->end()) {
+      return errors::NotFound("FeedInputs: unable to find feed output ", t);
+    }
+    Node* n = iter->second;
+    DCHECK_EQ(n->name(), id.first);  
+    if (id.second >= n->num_outputs()) {
+      return errors::InvalidArgument(
+          "FeedInputs: ", t, " should have output index < ", n->num_outputs());
+    } //看起来Tensorid 的first应该是name, second应该是输出节点数，这里就有一个疑问，n-> num_outputs()是如何定义的？
+
+    Node* feed_node;
+    TF_RETURN_IF_ERROR(
+        feed_rewrites[i]->AddNode(g, {n, id.second}, &feed_node));  //{n,id.second}说明了该节点对应的输出节点, 那么node是哪里出来的？？？ 
+
+    // Update name_index
+    (*name_index)[feed_node->name()] = feed_node;  //更改节点之后图的节点列表也需要更新
+    // Duplicate control edges aren't allowed, but feed_node was *just* created
+    // so there's no need to check for a duplicate.
+    g->AddControlEdge(g->source_node(), feed_node, true); //为更改之后的节点添加控制边
+
+    // Look through edges coming out of "n" for edges whose src_output() index
+    // matches "output_index".  If found, replace the edges with a connection
+    // from the special feed node.
+    std::vector<const Edge*> to_remove;
+    for (const Edge* e : n->out_edges()) {
+      if (e->src_output() == id.second) {
+        to_remove.emplace_back(e);
+      } else if (e->src_output() == Graph::kControlSlot &&
+                 (n->type_string() == "Placeholder" ||
+                  n->type_string() == "PlaceholderV2")) {
+        // When feeding a Placeholder node, any outgoing control edges
+        // will be replaced with a control edge from the replacement
+        // feed_node.
+        // TODO(josh11b,mrry): Come up with a more elegant way of addressing
+        // the general version of this problem.
+        to_remove.emplace_back(e);
+      }
+    } //这里就有个问题 新生成的Arg的type_string应该是啥？ 这时候可能得看一些节点类的定义
+
+    for (const Edge* e : to_remove) {
+      if (e->src_output() == id.second) {
+        g->AddEdge(feed_node, 0, e->dst(), e->dst_input());
+      } else {
+        CHECK_EQ(Graph::kControlSlot, e->src_output());
+        // Duplicate control edges aren't allowed, but feed_node was *just*
+        // created so there's no need to check for a duplicate.
+        g->AddControlEdge(feed_node, e->dst(), true);
+      }
+      g->RemoveEdge(e);
+    }
+    out_feed_types->push_back(BaseType(n->output_type(id.second)));
+  }
+  return Status::OK();
+}
+```
+在上边的代码中，关键问题是根据节点和节点的输出来添加ArgNode，那么这个时候关键问题就是ArgNode究竟是怎么来的,tensorflow写了一个类用来新建ArgNode。该类为ArgFeedRewrite，定义在tensorflow/core/graph/subgraph.h中。该类为PruneRewrite类的一个子类，并重写了初始化及AddNode函数。在初始化阶段定义了该类的成员变量arg_index以及父类的成员变量endpoint_name以及device_info。
+```C++
+class ArgFeedRewrite : public PruneRewrite {
+ public:
+  ArgFeedRewrite(const string* endpoint_name,
+                 const DeviceAttributes* device_info, int32 arg_index)
+      : PruneRewrite(endpoint_name, device_info), arg_index_(arg_index) {}
+  Status AddNode(Graph* g, NodeBuilder::NodeOut feed_tensor,
+                 Node** out_node) override;
+
+ private:
+  const int32 arg_index_;
+};
+
+```
+下边的代码片段为在RewriteGraphForExecution中ArgFeddRewrite的调用方式。可以看出，feed_outputs就是对应这endpoint_name, i则是需要添加的Arg的index
+```C++
+  if (use_function_convention) {
+    for (size_t i = 0; i < fed_outputs.size(); ++i) {
+      feed_rewrites.emplace_back(new ArgFeedRewrite(
+          &fed_outputs[i], &device_info, static_cast<int32>(i)));
+    }
+    
+ feed_rewrites[i]->AddNode(g, {n, id.second}, &feed_node))  //这里又遇到了id.second是什么的问题了
+   
+```
+然后是重点，该类的AddNode实现~这个函数简直是简单的让人抓狂。就只能继续看NodeBuilder的实现了。
+```C++
+Status ArgFeedRewrite::AddNode(Graph* g, NodeBuilder::NodeOut feed_tensor,
+                               Node** out_node) {
+  // NOTE(mrry): We must include the index as part of the node
+  // name, because _Arg is a "stateful" kernel and therefore
+  // its name must uniquely identify a kernel instance across all
+  // graphs in the same session.
+  TF_RETURN_IF_ERROR(
+      NodeBuilder(strings::StrCat("_arg_", feed_tensor.node->name(), "_",
+                                  feed_tensor.index, "_", arg_index_),
+                  "_Arg")
+          .Attr("T", BaseType(feed_tensor.node->output_type(feed_tensor.index)))
+          .Attr("index", arg_index_)
+          .Finalize(g, out_node));
+  (*out_node)->set_assigned_device_name(device_info().name());
+  return Status::OK();
+} 
+```
+NodeBuiler的定义在
