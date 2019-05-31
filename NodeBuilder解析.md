@@ -214,4 +214,104 @@ Status ArgFeedRewrite::AddNode(Graph* g, NodeBuilder::NodeOut feed_tensor,
   return Status::OK();
 } 
 ```
-NodeBuiler的定义在
+NodeBuiler的定义在/tensorflow/core/graph/node_builder.cc
+```C++
+NodeBuilder::NodeBuilder(StringPiece name, StringPiece op_name,
+                         const OpRegistryInterface* op_registry)
+    : def_builder_(name, op_name, op_registry) {}
+
+NodeBuilder::NodeBuilder(StringPiece name, const OpDef* op_def)
+    : def_builder_(name, op_def) {}
+Status NodeBuilder::Finalize(Graph* graph, Node** created_node) const {
+  // In case of error, set *created_node to nullptr.
+  if (created_node != nullptr) *created_node = nullptr;
+  if (!errors_.empty()) {
+    return errors::InvalidArgument(str_util::Join(errors_, "\n"));
+  }
+
+  NodeDef node_def;
+  TF_RETURN_IF_ERROR(def_builder_.Finalize(&node_def));   //先调用def_builder_中的Finalize
+  TF_RETURN_IF_ERROR(ValidateNodeDef(node_def, def_builder_.op_def())); 
+  TF_RETURN_IF_ERROR(
+      CheckOpDeprecation(def_builder_.op_def(), graph->versions().producer()));
+  Status status;
+  Node* node = graph->AddNode(node_def, &status);
+  if (!status.ok()) return status;
+
+  for (size_t i = 0; i < inputs_.size(); ++i) {
+    if (inputs_[i].node != nullptr) {  // Skip back edges.
+      graph->AddEdge(inputs_[i].node, inputs_[i].index, node, i);
+    }
+  } //如果节点有输入的话，给输入添加边
+  for (Node* control_input : control_inputs_) {
+    graph->AddControlEdge(control_input, node);
+  } //如果有控制边的话，就添加控制边
+  if (created_node != nullptr) *created_node = node;
+  return Status::OK();
+}   
+
+```
+其中 def_builder_的类型是NodeDefBuilder, 定义在tensorflow/core/node_def_builder.h中
+```C++
+NodeDefBuilder::NodeDefBuilder(StringPiece name, StringPiece op_name,
+                               const OpRegistryInterface* op_registry) {
+  node_def_.set_name(string(name));
+  const Status status = op_registry->LookUpOpDef(string(op_name), &op_def_); //这里从所有的op中根据名称找到相应的op并将op_def丢到op_def_中
+  if (status.ok()) {
+    Initialize(); 
+  } else {
+    errors_.push_back(status.error_message());
+    inputs_specified_ = 0;
+  }
+}  
+void NodeDefBuilder::Initialize() {
+  inputs_specified_ = 0;
+  node_def_.set_op(op_def_->name());  //set_op这个函数是干嘛用的 应该看一下
+}
+
+Status NodeDefBuilder::Finalize(NodeDef* node_def) const {
+  const std::vector<string>* errors_ptr = &errors_;
+  std::vector<string> errors_storage;
+  if (op_def_ != nullptr && inputs_specified_ < op_def_->input_arg_size()) {
+    // Since this is a const method, to add an error, we have to make
+    // a copy of the existing errors.
+    errors_storage = errors_;
+    errors_storage.push_back(
+        strings::StrCat(inputs_specified_, " inputs specified of ",
+                        op_def_->input_arg_size(), " inputs in Op"));
+    errors_ptr = &errors_storage;
+  }
+
+  if (!errors_ptr->empty()) {
+    if (errors_ptr->size() == 1) {
+      if (op_def_ == nullptr) {
+        return errors::InvalidArgument((*errors_ptr)[0],
+                                       " while building NodeDef '",
+                                       node_def_.name(), "'");
+      }
+      return errors::InvalidArgument(
+          (*errors_ptr)[0], " while building NodeDef '", node_def_.name(),
+          "' using ", SummarizeOpDef(*op_def_));
+    } else {
+      return errors::InvalidArgument(
+          errors_ptr->size(), " errors while building NodeDef '",
+          node_def_.name(), "' using ", SummarizeOpDef(*op_def_), ":\n",
+          str_util::Join(*errors_ptr, "\n"));
+    }
+  } else {
+    NodeDef node_def_backup;
+    if (node_def == nullptr) node_def = &node_def_backup;
+    *node_def = node_def_;
+
+    // Add control inputs after the regular inputs.
+    for (const auto& control_input : control_inputs_) {
+      node_def->add_input(strings::StrCat("^", control_input));
+    }
+
+    // Add default values for unspecified attrs.
+    AddDefaultsToNodeDef(*op_def_, node_def);
+
+    return Status::OK();
+  }
+}
+```
