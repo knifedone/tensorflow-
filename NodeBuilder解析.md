@@ -230,12 +230,12 @@ Status NodeBuilder::Finalize(Graph* graph, Node** created_node) const {
   }
 
   NodeDef node_def;
-  TF_RETURN_IF_ERROR(def_builder_.Finalize(&node_def));   //先调用def_builder_中的Finalize
+  TF_RETURN_IF_ERROR(def_builder_.Finalize(&node_def));   //先调用def_builder_中的Finalize 将node_def中的默认值设置好
   TF_RETURN_IF_ERROR(ValidateNodeDef(node_def, def_builder_.op_def())); 
   TF_RETURN_IF_ERROR(
       CheckOpDeprecation(def_builder_.op_def(), graph->versions().producer()));
   Status status;
-  Node* node = graph->AddNode(node_def, &status);
+  Node* node = graph->AddNode(node_def, &status); //根据node_def来添加节点
   if (!status.ok()) return status;
 
   for (size_t i = 0; i < inputs_.size(); ++i) {
@@ -251,7 +251,7 @@ Status NodeBuilder::Finalize(Graph* graph, Node** created_node) const {
 }   
 
 ```
-其中 def_builder_的类型是NodeDefBuilder, 定义在tensorflow/core/node_def_builder.h中
+其中 def_builder_的类型是NodeDefBuilder, 定义在tensorflow/core/framework/node_def_builder.h中
 ```C++
 NodeDefBuilder::NodeDefBuilder(StringPiece name, StringPiece op_name,
                                const OpRegistryInterface* op_registry) {
@@ -309,9 +309,101 @@ Status NodeDefBuilder::Finalize(NodeDef* node_def) const {
     }
 
     // Add default values for unspecified attrs.
-    AddDefaultsToNodeDef(*op_def_, node_def);
+    AddDefaultsToNodeDef(*op_def_, node_def); //根据op_def来为node_def设置初始值
 
     return Status::OK();
   }
 }
 ```
+```C++
+Status ValidateNodeDef(const NodeDef& node_def, const OpDef& op_def) {
+  if (node_def.op() != op_def.name()) {
+    return errors::InvalidArgument("NodeDef op '", node_def.op(),
+                                   "' does not match ", SummarizeOpDef(op_def),
+                                   "; NodeDef: ", SummarizeNodeDef(node_def));
+  }
+
+  bool seen_control = false;
+  size_t num_inputs = 0;
+  // TODO(josh11b): Unify the input field validation.
+  for (const string& input : node_def.input()) {
+    if (str_util::StartsWith(input, "^")) {
+      seen_control = true;
+      if (input.find(':') != string::npos) {
+        return errors::InvalidArgument(
+            "Control input '", input,
+            "' must not have ':' in NodeDef: ", SummarizeNodeDef(node_def));
+      }
+    } else if (seen_control) {
+      return errors::InvalidArgument(
+          "Non-control input '", input,
+          "' after control input in NodeDef: ", SummarizeNodeDef(node_def));
+    } else {
+      ++num_inputs;
+    }
+  } //得到这个node的input个数，并判断该node是否有控制边， 控制边只能有一条
+
+  std::unordered_map<string, const OpDef::AttrDef*> op_attrs;
+  for (const auto& attr : op_def.attr()) {
+    if (!gtl::InsertIfNotPresent(&op_attrs, attr.name(), &attr)) {
+      return errors::InvalidArgument("OpDef has duplicate attr name '",
+                                     attr.name(),
+                                     "': ", SummarizeOpDef(op_def));
+    }
+  } //新建一个attr_name:attr的map
+  for (const auto& attr : node_def.attr()) {
+    // Allow internal optional attributes with names starting with "_".
+    if (str_util::StartsWith(attr.first, "_")) {
+      continue;
+    }
+    auto iter = op_attrs.find(attr.first);
+    if (iter == op_attrs.end()) {
+      // A common cause of this error is that TensorFlow has made a
+      // backwards-compatible change to the NodeDef (e.g., adding a
+      // new attr with a default value), but the binary consuming the
+      // NodeDef does not know about the new attribute; the solution
+      // in these cases is to ensure that the binary consuming the
+      // NodeDef is built with a version of TensorFlow no earlier than
+      // the binary producing it.
+      return errors::InvalidArgument(
+          "NodeDef mentions attr '", attr.first, "' not in ",
+          SummarizeOpDef(op_def), "; NodeDef: ", SummarizeNodeDef(node_def),
+          ". (Check whether your GraphDef-interpreting binary is up to date "
+          "with your GraphDef-generating binary.).");
+    }
+    TF_RETURN_WITH_CONTEXT_IF_ERROR(
+        ValidateAttrValue(attr.second, *iter->second),
+        "; NodeDef: ", SummarizeNodeDef(node_def), "; ",
+        SummarizeOpDef(op_def));
+    // Keep track of which attr names have (not) been found in the NodeDef.
+    op_attrs.erase(iter);
+  }
+
+  // Were all attrs in the OpDef found in the NodeDef?
+  if (!op_attrs.empty()) {
+    string attrs;
+    for (const auto& attr_pair : op_attrs) {
+      if (!attrs.empty()) strings::StrAppend(&attrs, "', '");
+      strings::StrAppend(&attrs, attr_pair.first);
+    }
+    return errors::InvalidArgument("NodeDef missing attr",
+                                   op_attrs.size() == 1 ? " '" : "s '", attrs,
+                                   "' from ", SummarizeOpDef(op_def),
+                                   "; NodeDef: ", SummarizeNodeDef(node_def));
+  }
+
+  // Validate the number of inputs.
+  DataTypeVector inputs, outputs;
+  TF_RETURN_IF_ERROR(InOutTypesForNode(node_def, op_def, &inputs, &outputs));
+
+  if (num_inputs != inputs.size()) {
+    return errors::InvalidArgument(
+        "NodeDef expected inputs '", DataTypeVectorString(inputs),
+        "' do not match ", num_inputs, " inputs specified; ",
+        SummarizeOpDef(op_def), "; NodeDef: ", SummarizeNodeDef(node_def));
+  }
+
+  return Status::OK();
+}
+```
+
