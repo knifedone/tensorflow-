@@ -28,16 +28,16 @@ Status MPIAllgather::Execute(std::vector<TensorTableEntry>& entries, const Respo
 
   auto& first_entry = entries[0];
 
-  timeline.ActivityStartAll(entries, ALLOCATE_OUTPUT);
+  timeline.ActivityStartAll(entries, ALLOCATE_OUTPUT);  //tensor_states_[entries.name]设成activate
   Status status = AllocateOutput(entries, response, entry_component_sizes, recvcounts);
   if (!status.ok()) {
     return status;
-  }
-  timeline.ActivityEndAll(entries);
+  }   //set e.context->AllocateOutput(outputshape,&e.output) for e in entries
+  timeline.ActivityEndAll(entries); 
 
   SetDisplacements(recvcounts, displcmnts);
   SetEntryComponentOffsets(entries, entry_component_sizes, recvcounts, entry_component_offsets);
-
+    
   int element_size = mpi_context_->GetMPITypeSize(first_entry.tensor->dtype());
 
   const void* sendbuf = nullptr;
@@ -46,7 +46,7 @@ Status MPIAllgather::Execute(std::vector<TensorTableEntry>& entries, const Respo
 
   if (entries.size() > 1) {
     timeline.ActivityStartAll(entries, MEMCPY_IN_FUSION_BUFFER);
-    MemcpyInFusionBuffer(entries, displcmnts, element_size, buffer_data);
+    MemcpyInFusionBuffer(entries, displcmnts, element_size, buffer_data); \\这个element_size是什么？  
     timeline.ActivityEndAll(entries);
   } else {
     sendbuf = first_entry.tensor->data();
@@ -79,4 +79,58 @@ Status MPIAllgather::Execute(std::vector<TensorTableEntry>& entries, const Respo
 
   return Status::OK();
 }
+```
+```C++
+Status AllgatherOp::AllocateOutput(std::vector<TensorTableEntry>& entries, const Response& response,
+                                   int64_t**& entry_component_sizes, int*& recvcounts) {
+  for (size_t ec = 0; ec < entries.size(); ++ec) {
+    auto& e = entries[ec];
+    // Every tensor participating in Allgather operation may have different
+    // first dimension size, but the rest of dimensions are same for all
+    // tensors.  Here we get shape of tensor sliced by first dimension.
+    TensorShape single_slice_shape;
+    for (int i = 1; i < e.tensor->shape().dims(); ++i) {
+      single_slice_shape.AddDim(e.tensor->shape().dim_size(i));
+    }
+
+    // Copy tensor sizes from the MPI response into a vector of int64_t
+    // and compute total size.  This is size of first dimension.
+    int64_t total_entry_dimension_size = 0;
+    const auto& tensor_sizes = response.tensor_sizes();
+    for (int rc = 0; rc < global_state_->size; ++rc) {
+      auto component_size = tensor_sizes[ec * global_state_->size + rc];
+      total_entry_dimension_size += component_size;
+      recvcounts[rc] += component_size * single_slice_shape.num_elements();
+      entry_component_sizes[ec][rc] =
+          component_size * single_slice_shape.num_elements();
+    }
+
+    // Allgather output will have shape of:
+    // (sum of first dimension of every tensor) x (tensor slice shape).
+    TensorShape output_shape;
+    output_shape.AddDim((int64_t) total_entry_dimension_size);
+    output_shape.AppendShape(single_slice_shape);
+
+    Status status = e.context->AllocateOutput(output_shape, &e.output);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  return Status::OK();
+}
+
+```
+```C++
+int op = MPI_Allgatherv(sendbuf != nullptr ? sendbuf : MPI_IN_PLACE,
+                          (int) total_num_elements,
+                          dtype,
+                          buffer_data,
+                          recvcounts,
+                          displcmnts,
+                          dtype,
+                          mpi_context_->GetMPICommunicator(Communicator::GLOBAL));
+  if (op != MPI_SUCCESS) {
+    throw std::logic_error("MPI_Allgatherv failed, see MPI output for details.");
+  }
 ```
