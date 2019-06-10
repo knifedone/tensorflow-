@@ -475,6 +475,36 @@ Status RewriteGraphForExecution(
 ```
 可以看出，节点创建的关键点在于FeedInputs和FetchOutputs
 ```C++
+TensorId ParseTensorName(StringPiece name) {
+  // Parse either a name, ^name, or name:digits.  To do so, we go backwards from
+  // the end of the string, skipping over a run of digits.  If we hit a ':'
+  // character, then we know we are in the 'name:digits' regime.  Otherwise, we
+  // see if the name starts with '^', indicating a control edge. If we find
+  // neither ':' nor '^' characters, the output index is implicitly 0, and the
+  // whole name string forms the first part of the tensor name.
+  const char* base = name.data();
+  const char* p = base + name.size() - 1;
+  unsigned int index = 0;
+  unsigned int mul = 1;
+  while (p > base && (*p >= '0' && *p <= '9')) {
+    index += ((*p - '0') * mul);
+    mul *= 10;
+    p--;
+  }
+  TensorId id;
+  if (p > base && *p == ':' && mul > 1) {
+    id.first = StringPiece(base, p - base);
+    id.second = index;
+  } else if (str_util::StartsWith(name, "^")) {
+    // Control edge
+    id.first = StringPiece(base + 1);
+    id.second = Graph::kControlSlot;
+  } else {
+    id.first = name;
+    id.second = 0;
+  }
+  return id;
+}
 Status FeedInputs(
     Graph* g, const std::vector<std::unique_ptr<PruneRewrite>>& feed_rewrites,
     NameIndex* name_index, DataTypeVector* out_feed_types) {
@@ -777,4 +807,21 @@ Status ValidateNodeDef(const NodeDef& node_def, const OpDef& op_def) {
   return Status::OK();
 }
 ```
+```C++
+void Graph::RemoveNode(Node* node) {
+  TF_DCHECK_OK(IsValidNode(node)) << node->DebugString();
+  DCHECK(!node->IsSource());
+  DCHECK(!node->IsSink());
 
+  // Remove any edges involving this node.
+  while (!node->in_edges_.empty()) {
+    RemoveEdge(*node->in_edges_.begin());
+  }
+  while (!node->out_edges_.empty()) {
+    RemoveEdge(*node->out_edges_.begin());
+  }
+  ReleaseNode(node);
+}
+
+
+```
