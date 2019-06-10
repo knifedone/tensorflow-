@@ -1,3 +1,374 @@
+```C++
+Status DirectSession::CreateGraphs(
+    const BuildGraphOptions& subgraph_options,
+    std::unordered_map<string, std::unique_ptr<Graph>>* outputs,
+    std::unique_ptr<FunctionLibraryDefinition>* flib_def,
+    RunStateArgs* run_state_args, DataTypeVector* input_types,
+    DataTypeVector* output_types, int64* collective_graph_key) {
+  mutex_lock l(graph_state_lock_);
+  std::unique_ptr<ClientGraph> client_graph;
+
+  std::unique_ptr<GraphExecutionState> temp_exec_state_holder;
+  GraphExecutionState* execution_state = nullptr;
+  if (options_.config.graph_options().place_pruned_graph()) {
+    // Because we are placing pruned graphs, we need to create a
+    // new GraphExecutionState for every new unseen graph,
+    // and then place it.
+    GraphExecutionStateOptions prune_options;
+    prune_options.device_set = &device_set_;
+    prune_options.session_options = &options_;
+    prune_options.stateful_placements = stateful_placements_;
+    TF_RETURN_IF_ERROR(GraphExecutionState::MakeForPrunedGraph(
+        execution_state_->original_graph_def().library(), prune_options,
+        execution_state_->original_graph_def(), subgraph_options,
+        &temp_exec_state_holder, &client_graph));
+    execution_state = temp_exec_state_holder.get();
+  } else {
+    execution_state = execution_state_.get();
+    TF_RETURN_IF_ERROR(
+        execution_state->BuildGraph(subgraph_options, &client_graph));
+  }
+  *collective_graph_key = client_graph->collective_graph_key;
+
+  if (subgraph_options.callable_options.feed_size() !=
+      client_graph->feed_types.size()) {
+    return errors::Internal(
+        "Graph pruning failed: requested number of feed endpoints = ",
+        subgraph_options.callable_options.feed_size(),
+        " versus number of pruned feed endpoints = ",
+        client_graph->feed_types.size());
+  }
+  if (subgraph_options.callable_options.fetch_size() !=
+      client_graph->fetch_types.size()) {
+    return errors::Internal(
+        "Graph pruning failed: requested number of fetch endpoints = ",
+        subgraph_options.callable_options.fetch_size(),
+        " versus number of pruned fetch endpoints = ",
+        client_graph->fetch_types.size());
+  }
+
+  auto current_stateful_placements = execution_state->GetStatefulPlacements();
+  // Update our current state based on the execution_state's
+  // placements.  If there are any mismatches for a node,
+  // we should fail, as this should never happen.
+  for (auto placement_pair : current_stateful_placements) {
+    const string& node_name = placement_pair.first;
+    const string& placement = placement_pair.second;
+    auto iter = stateful_placements_.find(node_name);
+    if (iter == stateful_placements_.end()) {
+      stateful_placements_.insert(std::make_pair(node_name, placement));
+    } else if (iter->second != placement) {
+      return errors::Internal(
+          "Stateful placement mismatch. "
+          "Current assignment of ",
+          node_name, " to ", iter->second, " does not match ", placement);
+    }
+  }
+
+  stateful_placements_ = execution_state->GetStatefulPlacements();
+
+  // Remember the graph in run state if this is a partial run.
+  if (run_state_args->is_partial_run) {
+    run_state_args->graph.reset(new Graph(flib_def_.get()));
+    CopyGraph(*execution_state->full_graph(), run_state_args->graph.get());
+  }
+
+  // Partition the graph across devices.
+  PartitionOptions popts;
+  popts.node_to_loc = [](const Node* node) {
+    return node->assigned_device_name();
+  };
+  popts.new_name = [this](const string& prefix) {
+    return strings::StrCat(prefix, "/_", edge_name_counter_.fetch_add(1));
+  };
+  popts.get_incarnation = [](const string& name) {
+    // The direct session does not have changing incarnation numbers.
+    // Just return '1'.
+    return 1;
+  };
+  popts.flib_def = &client_graph->graph.flib_def();
+  popts.control_flow_added = false;
+
+  std::unordered_map<string, GraphDef> partitions;
+  TF_RETURN_IF_ERROR(Partition(popts, &client_graph->graph, &partitions));
+
+  std::vector<string> device_names;
+  for (auto device : devices_) {
+    // Extract the LocalName from the device.
+    device_names.push_back(DeviceNameUtils::LocalName(device->name()));
+  }
+
+  // Check for valid partitions.
+  for (const auto& partition : partitions) {
+    const string local_partition_name =
+        DeviceNameUtils::LocalName(partition.first);
+    if (std::count(device_names.begin(), device_names.end(),
+                   local_partition_name) == 0) {
+      return errors::InvalidArgument(
+          "Creating a partition for ", local_partition_name,
+          " which doesn't exist in the list of available devices. Available "
+          "devices: ",
+          str_util::Join(device_names, ","));
+    }
+  }
+
+  for (const auto& partition : partitions) {
+    std::unique_ptr<Graph> device_graph(
+        new Graph(client_graph->flib_def.get()));
+    GraphConstructorOptions device_opts;
+    // There are internal operations (e.g., send/recv) that we now allow.
+    device_opts.allow_internal_ops = true;
+    device_opts.expect_device_spec = true;
+    TF_RETURN_IF_ERROR(ConvertGraphDefToGraph(device_opts, partition.second,
+                                              device_graph.get()));
+    outputs->emplace(partition.first, std::move(device_graph));
+  }
+
+  GraphOptimizationPassOptions optimization_options;
+  optimization_options.session_options = &options_;
+  optimization_options.flib_def = client_graph->flib_def.get();
+  optimization_options.partition_graphs = outputs;
+  TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
+      OptimizationPassRegistry::POST_PARTITIONING, optimization_options));
+
+  Status s;
+  for (auto& partition : *outputs) {
+    const string& partition_name = partition.first;
+    std::unique_ptr<Graph>* graph = &partition.second;
+
+    VLOG(2) << "Created " << DebugString(graph->get()) << " for "
+            << partition_name;
+
+    // Give the device an opportunity to rewrite its subgraph.
+    Device* d;
+    s = device_mgr_->LookupDevice(partition_name, &d);
+    if (!s.ok()) break;
+    s = d->MaybeRewriteGraph(graph);
+    if (!s.ok()) {
+      break;
+    }
+  }
+  *flib_def = std::move(client_graph->flib_def);
+  std::swap(*input_types, client_graph->feed_types);
+  std::swap(*output_types, client_graph->fetch_types);
+  return s;
+}
+```
+
+```C++
+Status GraphExecutionState::BuildGraph(const BuildGraphOptions& options,
+                                       std::unique_ptr<ClientGraph>* out) {
+  VLOG(1) << "BuildGraph";
+  if (!graph_) {
+    // It is only valid to call this method directly when the original graph
+    // was created with the option `place_pruned_graph == false`.
+    return errors::Internal(
+        "Attempted to prune a graph that has not been fully initialized.");
+  }
+
+  // Grappler optimization might change the structure of a graph itself, and
+  // also it can add/prune functions to/from the library.
+  std::unique_ptr<Graph> optimized_graph;
+  std::unique_ptr<FunctionLibraryDefinition> optimized_flib;
+
+  Status s = OptimizeGraph(options, &optimized_graph, &optimized_flib);
+  if (!s.ok()) {
+    VLOG(2) << "Grappler optimization failed. Error: " << s.error_message();
+    // Simply copy the original graph and the function library if we couldn't
+    // optimize it.
+    optimized_graph.reset(new Graph(flib_def_.get()));
+    CopyGraph(*graph_, optimized_graph.get());
+    optimized_flib.reset(new FunctionLibraryDefinition(*flib_def_));
+  }
+
+  subgraph::RewriteGraphMetadata rewrite_metadata;
+  if (session_options_ == nullptr ||
+      !session_options_->config.graph_options().place_pruned_graph()) {
+    TF_RETURN_IF_ERROR(
+        PruneGraph(options, optimized_graph.get(), &rewrite_metadata));
+  } else {
+    // This GraphExecutionState represents a graph that was
+    // pruned when this was constructed, so we copy the metadata from
+    // a member variable.
+    CHECK(rewrite_metadata_);
+    rewrite_metadata = *rewrite_metadata_;
+  }
+
+  CHECK_EQ(options.callable_options.feed_size(),
+           rewrite_metadata.feed_types.size());
+  CHECK_EQ(options.callable_options.fetch_size(),
+           rewrite_metadata.fetch_types.size());
+
+  // TODO(andydavis): Clarify optimization pass requirements around CostModel.
+  GraphOptimizationPassOptions optimization_options;
+  optimization_options.session_options = session_options_;
+  optimization_options.graph = &optimized_graph;
+  optimization_options.flib_def = optimized_flib.get();
+  optimization_options.device_set = device_set_;
+
+  TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
+      OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, optimization_options));
+
+  int64 collective_graph_key = options.collective_graph_key;
+  if (collective_graph_key == BuildGraphOptions::kNoCollectiveGraphKey) {
+    // BuildGraphOptions does not specify a collective_graph_key.  Check all
+    // nodes in the Graph and FunctionLibraryDefinition for collective ops and
+    // if found, initialize a collective_graph_key as a hash of the ordered set
+    // of instance keys.
+    std::set<int32> instance_key_set;
+    for (Node* node : optimized_graph->nodes()) {
+      if (node->IsCollective()) {
+        int32 instance_key;
+        TF_RETURN_IF_ERROR(
+            GetNodeAttr(node->attrs(), "instance_key", &instance_key));
+        instance_key_set.emplace(instance_key);
+      } else {
+        const FunctionDef* fdef = optimized_flib->Find(node->def().op());
+        if (fdef != nullptr) {
+          for (const NodeDef& ndef : fdef->node_def()) {
+            if (ndef.op() == "CollectiveReduce" ||
+                ndef.op() == "CollectiveBcastSend" ||
+                ndef.op() == "CollectiveBcastRecv") {
+              int32 instance_key;
+              TF_RETURN_IF_ERROR(
+                  GetNodeAttr(ndef, "instance_key", &instance_key));
+              instance_key_set.emplace(instance_key);
+            }
+          }
+        }
+      }
+    }
+    if (!instance_key_set.empty()) {
+      uint64 hash = 0x8774aa605c729c72ULL;
+      for (int32 instance_key : instance_key_set) {
+        hash = Hash64Combine(instance_key, hash);
+      }
+      collective_graph_key = hash;
+    }
+  }
+
+  // Copy the extracted graph in order to make its node ids dense,
+  // since the local CostModel used to record its stats is sized by
+  // the largest node id.
+  std::unique_ptr<ClientGraph> dense_copy(
+      new ClientGraph(std::move(optimized_flib), rewrite_metadata.feed_types,
+                      rewrite_metadata.fetch_types, collective_graph_key));
+  CopyGraph(*optimized_graph, &dense_copy->graph);
+
+  // TODO(vrv): We should check invariants of the graph here.
+
+  *out = std::move(dense_copy);
+  return Status::OK();
+}
+```
+```C++
+Status GraphExecutionState::PruneGraph(
+    const BuildGraphOptions& options, Graph* graph,
+    subgraph::RewriteGraphMetadata* out_rewrite_metadata) {
+  std::vector<std::unique_ptr<subgraph::PruneRewrite>> feed_rewrites;
+  feed_rewrites.reserve(options.callable_options.feed_size());
+  std::vector<std::unique_ptr<subgraph::PruneRewrite>> fetch_rewrites;
+  fetch_rewrites.reserve(options.callable_options.fetch_size());
+  if (options.use_function_convention) {
+    std::vector<TensorAndDevice> tensors_and_devices;
+    for (int i = 0; i < options.callable_options.feed_size(); ++i) {
+      // WARNING: feed MUST be a reference, since ArgFeedRewrite and
+      // tensors_and_devices holds on to its address.
+      const string& feed = options.callable_options.feed(i);
+      const DeviceAttributes* device_info;
+      TF_RETURN_IF_ERROR(LookupDevice(*device_set_, feed,
+                                      options.callable_options.feed_devices(),
+                                      &device_info));
+      feed_rewrites.emplace_back(
+          new subgraph::ArgFeedRewrite(&feed, device_info, i));  //假设feed_dict{'a':1,'b':2},那么b对应的index为1
+      tensors_and_devices.push_back({ParseTensorName(feed), device_info});
+    }
+    if (!options.callable_options.fetch_devices().empty() &&
+        !options.callable_options.fetch_skip_sync()) {
+      return errors::Unimplemented(
+          "CallableOptions.fetch_skip_sync = false is not yet implemented. You "
+          "can set it to true instead, but MUST ensure that Device::Sync() is "
+          "invoked on the Device corresponding to the fetched tensor before "
+          "dereferencing the Tensor's memory.");
+    }
+    for (int i = 0; i < options.callable_options.fetch_size(); ++i) {
+      // WARNING: fetch MUST be a reference, since RetvalFetchRewrite and
+      // tensors_and_devices holds on to its address.
+      const string& fetch = options.callable_options.fetch(i);
+      const DeviceAttributes* device_info;
+      TF_RETURN_IF_ERROR(LookupDevice(*device_set_, fetch,
+                                      options.callable_options.fetch_devices(),
+                                      &device_info));
+      fetch_rewrites.emplace_back(
+          new subgraph::RetvalFetchRewrite(&fetch, device_info, i));
+      tensors_and_devices.push_back({ParseTensorName(fetch), device_info});
+    }
+    TF_RETURN_IF_ERROR(
+        ValidateFeedAndFetchDevices(*graph, tensors_and_devices));
+  } else {
+    if (!options.callable_options.feed_devices().empty() ||
+        !options.callable_options.fetch_devices().empty()) {
+      return errors::Unimplemented(
+          "CallableOptions::feed_devices and CallableOptions::fetch_devices "
+          "to configure feeding/fetching tensors to/from device memory is not "
+          "yet supported when using a remote session.");
+    }
+    const DeviceAttributes* device_info =
+        &device_set_->client_device()->attributes();
+    for (const string& feed : options.callable_options.feed()) {
+      feed_rewrites.emplace_back(
+          new subgraph::RecvFeedRewrite(&feed, device_info));
+    }
+    for (const string& fetch : options.callable_options.fetch()) {
+      fetch_rewrites.emplace_back(
+          new subgraph::SendFetchRewrite(&fetch, device_info));
+    }
+  }
+
+  for (const TensorConnection& tensor_connection :
+       options.callable_options.tensor_connection()) {
+    Node* from_node = nullptr;
+    TensorId from_id(ParseTensorName(tensor_connection.from_tensor()));
+
+    for (Node* n : graph->nodes()) {
+      if (n->name() == from_id.first) {
+        from_node = n;
+        break;
+      }
+    }
+    if (from_node == nullptr) {
+      return errors::InvalidArgument(
+          "Requested tensor connection from unknown node: \"",
+          tensor_connection.to_tensor(), "\".");
+    }
+    if (from_id.second >= from_node->num_outputs()) {
+      return errors::InvalidArgument(
+          "Requested tensor connection from unknown edge: \"",
+          tensor_connection.to_tensor(),
+          "\" (actual number of outputs = ", from_node->num_outputs(), ").");
+    }
+
+    feed_rewrites.emplace_back(new TensorConnectionPruneRewrite(
+        &tensor_connection.to_tensor(), {from_node, from_id.second}));
+  }
+
+  std::vector<string> target_node_names(
+      options.callable_options.target().begin(),
+      options.callable_options.target().end());
+  TF_RETURN_IF_ERROR(subgraph::RewriteGraphForExecution(
+      graph, feed_rewrites, fetch_rewrites, target_node_names,
+      out_rewrite_metadata));
+
+  CHECK_EQ(out_rewrite_metadata->feed_types.size(),
+           options.callable_options.feed_size() +
+               options.callable_options.tensor_connection_size());
+  for (int i = 0; i < options.callable_options.tensor_connection_size(); ++i) {
+    out_rewrite_metadata->feed_types.pop_back();
+  }
+  return Status::OK();
+}
+```
+
 在graph中，图的重写的创建是由RewriteGraphForExecution完成的。该函数的实现在tensorflow/core/graph/subgraph.cc中。
 首先根据fed_outputs和fetch_outputs创建feed_rewrites和fetch_outputs。然后再调用重载的一个函数RewriteGraphForExecution。
 ```C++
