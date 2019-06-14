@@ -825,3 +825,16 @@ void Graph::RemoveNode(Node* node) {
 
 
 ```
+```C++
+void ArgOp::Compute(OpKernelContext* ctx) {
+  auto frame = ctx->call_frame();
+  OP_REQUIRES(ctx, frame != nullptr, errors::Internal("no call frame"));
+  Tensor val;
+  OP_REQUIRES_OK(ctx, frame->GetArg(index_, &val));
+  OP_REQUIRES(ctx, val.dtype() == dtype_,
+              errors::InvalidArgument("Type mismatch: actual ",
+                                      DataTypeString(val.dtype()),
+                                      " vs. expect ", DataTypeString(dtype_)));
+  ctx->set_output(0, val);
+}
+```
